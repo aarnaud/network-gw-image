@@ -1,16 +1,24 @@
 # Runtime contract
 
-This image runs `systemd-networkd` standalone (not under full `systemd` PID 1) to manage
-interfaces, addressing, routing, and native WireGuard for one container in a Kubernetes
-Pod. It is one of three independent containers in that Pod — a separate Shorewall
-container owns firewall/NAT rules, and a separate CrowdSec firewall-bouncer container
-owns dynamic IP banning. This container does not coordinate with either; it only touches
-its own concern against the Pod's shared network namespace.
+This single image supports two roles, selected by which entrypoint script the Pod
+container invokes. Both roles are containers in the same three-container gateway Pod
+(Multus-attached, one network "scope" per sibling container); a separate CrowdSec
+firewall-bouncer container is not built here and is not covered by this contract. The
+two roles here are fully independent of each other and of the bouncer — no shared
+volumes, no startup ordering, no handoff — each only touches its own concern against the
+Pod's shared network namespace.
+
+| Role | Entrypoint | What it owns |
+|---|---|---|
+| `networkd` (default) | `/usr/local/sbin/netgw-entrypoint.sh` (the image's default `ENTRYPOINT`) | Interfaces, addressing, routing, native WireGuard (client + server) via `systemd-networkd`. |
+| `shorewall` | override `command: ["/usr/bin/tini", "--", "/usr/local/sbin/netgw-shorewall-entrypoint.sh"]` | All firewall/NAT rules, via Shorewall + Shorewall6. |
 
 None of the following can be set by the Dockerfile — they must be provided by the Pod
-spec.
+spec, and differ by role.
 
-## Privileged container required
+## `networkd` role
+
+### Privileged container required
 
 ```yaml
 securityContext:
@@ -31,7 +39,7 @@ own internal machinery for this transition) inside a container runtime, and matc
 common practice for other node-level networking daemons (Calico, Cilium, Multus itself
 typically also run privileged).
 
-## Volume mounts
+### Volume mounts
 
 | Container path | Source | Why |
 |---|---|---|
@@ -43,12 +51,12 @@ watcher relies on inotify events on these directories to detect changes and relo
 `subPath` mounts are explicitly excluded from kubelet's ConfigMap/Secret live-update
 mechanism, so a `subPath` mount would never trigger a reload.
 
-## Config authoring notes
+### Config authoring notes
 
 - Use `IPv4Forwarding=`/`IPv6Forwarding=` in `.network` files, not the deprecated
   `IPForward=`.
 - Do not set `IPMasquerade=` in any `.network`/`.netdev` file shipped here — NAT is the
-  Shorewall container's responsibility. Enabling it here risks two containers racing to
+  Shorewall role's responsibility. Enabling it here risks two containers racing to
   manage overlapping nftables state in the same network namespace.
 - `[Match] Name=` values must match whatever interface names Multus actually assigns
   (commonly `net1`, `net2`, … unless renamed via the `k8s.v1.cni.cncf.io/networks`
@@ -56,9 +64,63 @@ mechanism, so a `subPath` mount would never trigger a reload.
 - The node kernel must already have WireGuard support; this container cannot load kernel
   modules (no `CAP_SYS_MODULE`).
 
-## Diagnostics
+### Diagnostics
 
 No D-Bus is included in this image, so `networkctl status`/`networkctl reload` are not
 available. Use `wg show`, `ip link`, `ip addr`, and container logs instead. Reload is
 automatic — the watcher sends `systemd-networkd` a `SIGHUP` whenever the mounted
 ConfigMap/Secret changes; there is no manual reload step.
+
+## `shorewall` role
+
+### Capabilities — much lighter than `networkd`, not privileged
+
+```yaml
+securityContext:
+  capabilities:
+    add:
+      - NET_ADMIN
+      - NET_RAW
+```
+
+Verified directly: `shorewall check`/`start`/`reload` all work under exactly this pair,
+no privilege-drop dance like `systemd-networkd` has (Shorewall is just a root-run script
+driving `iptables-restore`/`nft`, nothing forks to a lesser-privileged user).
+
+Shorewall also tries to tune `net.ipv4.conf.*.rp_filter` and `log_martians` via
+`/proc/sys` on every start/reload. Docker/Kubernetes mount `/proc/sys` read-only by
+default, so you'll see benign `cannot create .../rp_filter: Read-only file system`
+warnings in the logs — these do not stop the ruleset from applying (`iptables-restore`
+still runs and completes). If you don't want the warnings, set `ROUTE_FILTER=no` and
+`LOG_MARTIANS=no` in `shorewall.conf`; otherwise ignore them, or allow those specific
+sysctls as unsafe sysctls on the node if you want Shorewall to actually manage them.
+
+### Volume mounts
+
+| Container path | Source | Why |
+|---|---|---|
+| `/etc/shorewall` | ConfigMap | IPv4 ruleset: `zones`, `interfaces`, `policy`, `rules`, `snat`, `shorewall.conf`, etc. |
+| `/etc/shorewall6` | ConfigMap (optional) | IPv6 ruleset, same file set. Omit entirely if IPv6 isn't needed — the container detects an unconfigured `shorewall6` (no `zones` content) and skips it without error. |
+
+**Mount as whole-directory volumes — never `subPath`** (same live-reload reasoning as
+the `networkd` role).
+
+### Config authoring notes
+
+- The `interfaces` file needs `?FORMAT 2` as its first line to use the modern 3-column
+  `ZONE INTERFACE OPTIONS` syntax; without it, Shorewall expects an extra `BROADCAST`
+  column (format 1) and will reject the file with a confusing `Invalid BROADCAST
+  address` error if that column is missing.
+- Use the `snat` file, not `masq` — `masq` was removed before Shorewall 5.2.8, which is
+  what ships in `debian:stable-slim`.
+- At least one real (non-`firewall`) zone with a matching `interfaces` entry is required
+  for `shorewall check` to pass; the bare package defaults (no zones) intentionally fail
+  `check` and are left unstarted until the real ConfigMap is mounted.
+
+### Diagnostics
+
+`shorewall status`, `iptables -L -n`, `nft list ruleset`, and container logs. Reload is
+automatic — the watcher re-runs `shorewall check && shorewall reload` (and the `6`
+equivalent) whenever the mounted ConfigMap changes; there is no manual reload step. A
+config that fails `check` is never applied — the previously-running ruleset is left in
+place and the failure is logged.

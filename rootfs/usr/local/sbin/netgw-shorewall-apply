@@ -1,0 +1,30 @@
+#!/bin/bash
+# Validates and (re)applies Shorewall + Shorewall6 rulesets from whatever is
+# currently mounted at /etc/shorewall and /etc/shorewall6. Idempotent and
+# safe to call repeatedly: `shorewall reload` works correctly even if the
+# firewall was never started, so there is no separate first-start code path.
+set -uo pipefail
+
+source /usr/local/sbin/netgw-lib.sh
+
+apply_one() {
+	local tool="$1" dir="$2"
+
+	if ! grep -qE '^[^#[:space:]]' "$dir/zones" 2>/dev/null; then
+		debug "$tool: no zones configured in $dir, skipping"
+		return 0
+	fi
+
+	if "$tool" check >/dev/null 2>&1; then
+		if "$tool" reload >/dev/null 2>&1; then
+			log "$tool: applied"
+		else
+			log "$tool: reload command failed -- ruleset may be stale, check manually"
+		fi
+	else
+		log "$tool: check failed, keeping previous ruleset running (if any)"
+	fi
+}
+
+apply_one shorewall /etc/shorewall
+apply_one shorewall6 /etc/shorewall6

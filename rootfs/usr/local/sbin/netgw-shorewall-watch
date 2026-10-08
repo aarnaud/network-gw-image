@@ -1,0 +1,39 @@
+#!/bin/bash
+# Long-running watcher for the Shorewall role: reapplies the ruleset
+# whenever the mounted ConfigMap(s) at /etc/shorewall or /etc/shorewall6
+# change. Watches the directories themselves, not individual files, so it
+# survives Kubernetes' atomic ..data symlink-swap update pattern. This
+# script is tini's direct child for this role, so it also owns clean
+# shutdown (Shorewall has no daemon of its own to handle SIGTERM itself).
+set -uo pipefail
+
+source /usr/local/sbin/netgw-lib.sh
+
+cleanup() {
+	log "shutting down, clearing firewall rules"
+	kill "$watcher_pid" 2>/dev/null || true
+	shorewall clear >/dev/null 2>&1 || true
+	shorewall6 clear >/dev/null 2>&1 || true
+	exit 0
+}
+trap cleanup TERM INT
+
+watch_dirs=(/etc/shorewall /etc/shorewall6)
+log "watching: ${watch_dirs[*]} (debounce ${NETGW_RECONCILE_DEBOUNCE_SECONDS}s)"
+
+# Run the inotify pipeline in the background and `wait` on it rather than
+# blocking on it as a foreground command: bash only runs pending traps once
+# a *foreground* command/pipeline completes, which inotifywait -m never
+# does on its own. `wait` on a background job, by contrast, is itself
+# interruptible by a trap, which is what lets SIGTERM actually reach
+# cleanup() promptly instead of stalling until tini's SIGKILL timeout.
+(
+	inotifywait -m -r -e create,modify,delete,move,close_write "${watch_dirs[@]}" 2>/dev/null |
+	while read -r event_dir event_types event_file; do
+		debug "event: $event_types $event_dir$event_file"
+		drain_debounce
+		/usr/local/sbin/netgw-shorewall-apply
+	done
+) &
+watcher_pid=$!
+wait "$watcher_pid"
