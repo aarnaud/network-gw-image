@@ -1,0 +1,27 @@
+#!/bin/bash
+# Long-running watcher: reloads systemd-networkd (via SIGHUP) whenever the
+# mounted ConfigMap (/etc/systemd/network) or Secret
+# (/etc/systemd/network-secrets) changes. Watches the directories themselves
+# rather than individual files so it survives Kubernetes' atomic ..data
+# symlink-swap update pattern, which replaces the files, not edits them.
+set -euo pipefail
+
+source /usr/local/sbin/netgw-lib.sh
+
+pidfile="${1:?usage: netgw-watch <pidfile>}"
+watch_dirs=(/etc/systemd/network /etc/systemd/network-secrets)
+
+log "watching: ${watch_dirs[*]} (debounce ${NETGW_RECONCILE_DEBOUNCE_SECONDS}s)"
+
+inotifywait -m -r -e create,modify,delete,move,close_write "${watch_dirs[@]}" 2>/dev/null |
+while read -r event_dir event_types event_file; do
+	debug "event: $event_types $event_dir$event_file"
+	drain_debounce
+
+	pid=$(cat "$pidfile" 2>/dev/null) || { log "pid file $pidfile missing, skipping reload"; continue; }
+	if kill -HUP "$pid" 2>/dev/null; then
+		log "config change detected, reloaded systemd-networkd (pid $pid)"
+	else
+		log "config change detected, but failed to signal pid $pid"
+	fi
+done
