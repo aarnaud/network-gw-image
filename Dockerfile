@@ -1,8 +1,8 @@
 FROM debian:stable-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      systemd tini inotify-tools \
-      iproute2 wireguard-tools iptables nftables shorewall shorewall6 \
+      systemd udev tini inotify-tools \
+      iproute2 wireguard-tools iptables nftables shorewall shorewall6 ipset \
       procps ca-certificates tcpdump bind9-dnsutils curl mtr-tiny \
  && rm -rf /var/lib/apt/lists/*
 

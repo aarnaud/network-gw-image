@@ -21,5 +21,8 @@ chown -R systemd-network:systemd-network /etc/systemd/network-secrets 2>/dev/nul
 log "starting config watcher (debounce ${NETGW_RECONCILE_DEBOUNCE_SECONDS}s)"
 /usr/local/sbin/netgw-watch /run/netgw/networkd.pid &
 
+log "starting udevd"
+/usr/lib/systemd/systemd-udevd --daemon
+
 log "starting systemd-networkd"
 exec /usr/lib/systemd/systemd-networkd
